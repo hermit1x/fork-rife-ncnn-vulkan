@@ -109,6 +109,7 @@ static void print_usage()
     fprintf(stderr, "  -1 input1-path       input image1 path (jpg/png/webp)\n");
     fprintf(stderr, "  -i input-path        input image directory (jpg/png/webp)\n");
     fprintf(stderr, "  -o output-path       output image path (jpg/png/webp) or directory\n");
+    fprintf(stderr, "  -I input-video-path  input video path (mp4/mov)\n");
     fprintf(stderr, "  -n num-frame         target frame count (default=N*2)\n");
     fprintf(stderr, "  -s time-step         time step (0~1, default=0.5)\n");
     fprintf(stderr, "  -m model-path        rife model path (default=rife-v2.3)\n");
@@ -243,6 +244,11 @@ public:
     ncnn::Mat in0image;
     ncnn::Mat in1image;
     ncnn::Mat outimage;
+
+    bool operator < (const Task& rhs) const
+    {
+        return id > rhs.id;
+    }
 };
 
 class TaskQueue
@@ -277,7 +283,7 @@ public:
             condition.wait(lock);
         }
 
-        v = tasks.front();
+        v = tasks.top();
         tasks.pop();
 
         lock.unlock();
@@ -288,7 +294,7 @@ public:
 private:
     ncnn::Mutex lock;
     ncnn::ConditionVariable condition;
-    std::queue<Task> tasks;
+    std::priority_queue<Task> tasks;
 };
 
 TaskQueue toproc;
@@ -318,7 +324,7 @@ void* load(void* args)
         const path_t& image1path = ltp->input1_files[i];
 
         Task v;
-        v.id = i;
+        v.id = i + 1;
         v.in0path = image0path;
         v.in1path = image1path;
         v.outpath = ltp->output_files[i];
@@ -334,6 +340,216 @@ void* load(void* args)
         }
     }
 
+    return 0;
+}
+
+// #include <opencv2/opencv.hpp>
+#include <media/NdkMediaCodec.h>
+#include <media/NdkMediaExtractor.h>
+class LoadVideoThreadParams
+{
+public:
+    path_t input_videopath;
+    path_t outputpath;
+    path_t pattern;
+    path_t format;
+};
+
+void* load_video(void* args) {
+    const LoadVideoThreadParams* ltp = (const LoadVideoThreadParams*)args;
+    const path_t& input_videopath = ltp->input_videopath;
+    const path_t& outputpath = ltp->outputpath;
+    const path_t& pattern = ltp->pattern;
+    const path_t& format = ltp->format;
+
+    FILE* video_file = fopen(input_videopath.c_str(), "r");
+    int fd = fileno(video_file);
+
+    AMediaExtractor* extractor = AMediaExtractor_new();
+    // int status = AMediaExtractor_setDataSource(extractor, input_videopath.c_str());
+    int status = AMediaExtractor_setDataSourceFd(extractor, fd, 0, INT64_MAX);
+
+    if (status != AMEDIA_OK) {
+        fprintf(stderr, "Failed to set data source: %d\n", status);
+
+        fclose(video_file);
+        AMediaExtractor_delete(extractor);
+    
+        return 0;
+    }
+
+    // get video track
+    int videoTrackIndex = -1;
+    int trackCount = AMediaExtractor_getTrackCount(extractor);
+    for (int i = 0; i < trackCount; ++i) {
+        AMediaFormat* media_format = AMediaExtractor_getTrackFormat(extractor, i);
+        const char* mime = nullptr;
+        if (AMediaFormat_getString(media_format, AMEDIAFORMAT_KEY_MIME, &mime) && strncmp(mime, "video/", 6) == 0) {
+            videoTrackIndex = i;
+            break;
+        }
+        AMediaFormat_delete(media_format);
+    }
+
+    if (videoTrackIndex == -1) {
+        printf("Failed to find video track\n");
+
+        fclose(video_file);
+        AMediaExtractor_delete(extractor);
+        return 0;
+    }
+
+    // init codec
+    AMediaFormat* videoFormat = AMediaExtractor_getTrackFormat(extractor, videoTrackIndex);
+    AMediaExtractor_selectTrack(extractor, videoTrackIndex);
+
+    // get width and height
+    int width = 0;
+    int height = 0;
+    AMediaFormat_getInt32(videoFormat, AMEDIAFORMAT_KEY_WIDTH, &width);
+    AMediaFormat_getInt32(videoFormat, AMEDIAFORMAT_KEY_HEIGHT, &height);
+
+    const char* mime = nullptr;
+    AMediaFormat_getString(videoFormat, AMEDIAFORMAT_KEY_MIME, &mime);
+    AMediaCodec* codec = AMediaCodec_createDecoderByType(mime);
+    AMediaCodec_configure(codec, videoFormat, nullptr, nullptr, 0);
+    AMediaCodec_start(codec);
+
+    int frame_id = 0;
+    unsigned char *pre_pixeldata = nullptr;
+    size_t bufferSize = 0;
+
+    bool sawInputEOS = false;
+    bool sawOutputEOS = false;
+    while (!sawOutputEOS) {
+        // 处理输入缓冲区
+        if (!sawInputEOS) {
+            ssize_t inputBufferIndex = AMediaCodec_dequeueInputBuffer(codec, 1000);
+            if (inputBufferIndex >= 0) {
+                size_t inputBufferSize;
+                unsigned char* inputBuffer = AMediaCodec_getInputBuffer(codec, inputBufferIndex, &inputBufferSize);
+
+                ssize_t sampleSize = AMediaExtractor_readSampleData(extractor, inputBuffer, inputBufferSize);
+                if (sampleSize < 0) {
+                    sawInputEOS = true;
+                    sampleSize = 0;
+                }
+
+                uint64_t presentationTimeUs = AMediaExtractor_getSampleTime(extractor);
+                AMediaCodec_queueInputBuffer(codec, inputBufferIndex, 0, sampleSize,
+                                                presentationTimeUs,
+                                                sawInputEOS ? AMEDIACODEC_BUFFER_FLAG_END_OF_STREAM : 0);
+
+                AMediaExtractor_advance(extractor);
+            }
+        }
+
+        // 处理输出缓冲区
+        AMediaCodecBufferInfo bufferInfo;
+        ssize_t outputBufferIndex = AMediaCodec_dequeueOutputBuffer(codec, &bufferInfo, 1000);
+
+        if (outputBufferIndex >= 0) {
+            if (bufferInfo.flags & AMEDIACODEC_BUFFER_FLAG_END_OF_STREAM) {
+                sawOutputEOS = true;
+            }
+            
+            size_t outputBufferSize; // Y 占 1个字节，U,V 各占 1/4，outBufferSize = width * height * 1.5
+            uint8_t* outputBuffer = AMediaCodec_getOutputBuffer(codec, outputBufferIndex, &outputBufferSize);
+            // printf("load %d\n", frame_id * 2);
+            
+            if (pre_pixeldata == nullptr) {
+                unsigned char* pixeldata = (unsigned char*)malloc(width * height * 3);
+                ncnn::yuv420sp2rgb_nv12(outputBuffer, width, height, pixeldata);
+
+                bufferSize = width * height * 3;
+                pre_pixeldata = (uint8_t*)malloc(bufferSize);
+                
+                memcpy(pre_pixeldata, pixeldata, bufferSize);
+
+                char tmp[256];
+                sprintf(tmp, pattern.c_str(), 1);
+                path_t output_filename = path_t(tmp) + PATHSTR('.') + format;
+
+                Task v;
+                v.id = frame_id * 2 + 1;
+                v.in0image = ncnn::Mat(width, height, (void*)pixeldata, (size_t)3, 3);
+                v.in1image = ncnn::Mat(width, height, (size_t)3, 3);
+                v.timestep = 0.f;
+                v.outimage = ncnn::Mat(width, height, (size_t)3, 3);
+                v.outpath = outputpath + PATHSTR('/') + output_filename;
+                v.webp0 = 0;
+                v.webp1 = 0;
+
+                toproc.put(v);
+                frame_id++;
+
+                AMediaCodec_releaseOutputBuffer(codec, outputBufferIndex, false);
+                continue;
+            }
+
+            /*
+            pre_pixeldata    + pixeldata          -> interpolate
+            null             + pixeldata_skip     -> skip interpolate
+            pixeldata_to_pre +  (next) pixel data -> interpolate
+            */
+
+            unsigned char* pixeldata = (unsigned char*)malloc(width * height * 3);
+            unsigned char* pixeldata_skip = (unsigned char*)malloc(width * height * 3);
+            unsigned char* pixeldata_to_pre = (unsigned char*)malloc(width * height * 3);
+
+            ncnn::yuv420sp2rgb_nv12(outputBuffer, width, height, pixeldata);
+            memcpy(pixeldata_skip, pixeldata, width * height * 3);
+            memcpy(pixeldata_to_pre, pixeldata, width * height * 3);
+
+
+            char tmp[256];
+            sprintf(tmp, pattern.c_str(), frame_id * 2);
+            path_t output_filename = path_t(tmp) + PATHSTR('.') + format;
+
+            Task v;
+            v.id = frame_id * 2; // Use timestamp as ID
+            v.in0image = ncnn::Mat(width, height, (void*)pre_pixeldata, (size_t)3, 3);
+            v.in1image = ncnn::Mat(width, height, (void*)pixeldata, (size_t)3, 3); 
+            v.outpath = outputpath + PATHSTR('/') + output_filename;
+            v.timestep = 0.5f; // Default timestep
+            v.outimage = ncnn::Mat(width, height, (size_t)3, 3);
+
+            toproc.put(v);
+
+
+            sprintf(tmp, pattern.c_str(), frame_id * 2 + 1);
+            output_filename = path_t(tmp) + PATHSTR('.') + format;
+
+            Task v2;
+            v2.id = frame_id * 2 + 1; // Use timestamp as I
+            v2.in1image = ncnn::Mat(width, height, (void*)pixeldata_skip, (size_t)3, 3); 
+            v2.outpath = outputpath + PATHSTR('/') + output_filename;
+            v2.timestep = 1.f; // Default timestep
+            v2.outimage = ncnn::Mat(width, height, (size_t)3, 3);
+
+            toproc.put(v2);
+
+            pre_pixeldata = pixeldata_to_pre;
+
+
+            frame_id++;
+
+            AMediaCodec_releaseOutputBuffer(codec, outputBufferIndex, false);
+        }
+        // else if (outputBufferIndex == AMEDIACODEC_INFO_OUTPUT_BUFFERS_CHANGED) {
+        // }
+        // else if (outputBufferIndex == AMEDIACODEC_INFO_OUTPUT_FORMAT_CHANGED) {
+        //     AMediaFormat* newFormat = AMediaCodec_getOutputFormat(codec);
+        // }
+    }
+
+    AMediaCodec_stop(codec);
+    AMediaCodec_delete(codec);
+    AMediaExtractor_delete(extractor);
+    fclose(video_file);
+    free(pre_pixeldata);
+    pre_pixeldata = nullptr;
+    
     return 0;
 }
 
@@ -446,6 +662,7 @@ int main(int argc, char** argv)
     path_t input1path;
     path_t inputpath;
     path_t outputpath;
+    path_t input_videopath;
     int numframe = 0;
     float timestep = 0.5f;
     path_t model = PATHSTR("rife-v2.3");
@@ -462,7 +679,7 @@ int main(int argc, char** argv)
 #if _WIN32
     setlocale(LC_ALL, "");
     wchar_t opt;
-    while ((opt = getopt(argc, argv, L"0:1:i:o:n:s:m:g:j:f:vxzuh")) != (wchar_t)-1)
+    while ((opt = getopt(argc, argv, L"0:1:i:o:I:n:s:m:g:j:f:vxzuh")) != (wchar_t)-1)
     {
         switch (opt)
         {
@@ -477,6 +694,9 @@ int main(int argc, char** argv)
             break;
         case L'o':
             outputpath = optarg;
+            break;
+        case L'I':
+            input_videopath = optarg;
             break;
         case L'n':
             numframe = _wtoi(optarg);
@@ -517,7 +737,7 @@ int main(int argc, char** argv)
     }
 #else // _WIN32
     int opt;
-    while ((opt = getopt(argc, argv, "0:1:i:o:n:s:m:g:j:f:vxzuh")) != -1)
+    while ((opt = getopt(argc, argv, "0:1:i:o:I:n:s:m:g:j:f:vxzuh")) != -1)
     {
         switch (opt)
         {
@@ -532,6 +752,9 @@ int main(int argc, char** argv)
             break;
         case 'o':
             outputpath = optarg;
+            break;
+        case 'I':
+            input_videopath = optarg;
             break;
         case 'n':
             numframe = atoi(optarg);
@@ -572,7 +795,7 @@ int main(int argc, char** argv)
     }
 #endif // _WIN32
 
-    if (((input0path.empty() || input1path.empty()) && inputpath.empty()) || outputpath.empty())
+    if (((input0path.empty() || input1path.empty()) && inputpath.empty() && input_videopath.empty()) || outputpath.empty())
     {
         print_usage();
         return -1;
@@ -693,9 +916,15 @@ int main(int argc, char** argv)
     std::vector<path_t> input1_files;
     std::vector<path_t> output_files;
     std::vector<float> timesteps;
+    bool input_video_flag = false;
     {
-        if (!inputpath.empty() && path_is_directory(inputpath) && path_is_directory(outputpath))
+        if (!input_videopath.empty() && !path_is_directory(input_videopath) && path_is_directory(outputpath)) {
+            input_video_flag = true;
+            // printf("use video input\n");
+        }
+        else if (!inputpath.empty() && path_is_directory(inputpath) && path_is_directory(outputpath))
         {
+            // -i, -o, input_frames output_frames 一堆图片
             std::vector<path_t> filenames;
             int lr = list_directory(inputpath, filenames);
             if (lr != 0)
@@ -710,7 +939,7 @@ int main(int argc, char** argv)
             output_files.resize(numframe);
             timesteps.resize(numframe);
 
-            double scale = (double)count / numframe;
+            double scale = (double)(count - 1.0) / (numframe - 1.0);
             for (int i=0; i<numframe; i++)
             {
                 // TODO provide option to control timestep interpolate method
@@ -752,6 +981,7 @@ int main(int argc, char** argv)
         }
         else if (inputpath.empty() && !path_is_directory(input0path) && !path_is_directory(input1path) && !path_is_directory(outputpath))
         {
+            // -0, -1, 输入两张图片
             input0_files.push_back(input0path);
             input1_files.push_back(input1path);
             output_files.push_back(outputpath);
@@ -829,15 +1059,31 @@ int main(int argc, char** argv)
 
         // main routine
         {
-            // load image
-            LoadThreadParams ltp;
-            ltp.jobs_load = jobs_load;
-            ltp.input0_files = input0_files;
-            ltp.input1_files = input1_files;
-            ltp.output_files = output_files;
-            ltp.timesteps = timesteps;
+            ncnn::Thread *load_thread_ptr = nullptr;
+            LoadThreadParams ltp; // 放 if 里面会先被析构掉
+            LoadVideoThreadParams lvtp;
 
-            ncnn::Thread load_thread(load, (void*)&ltp);
+            if (!input_video_flag) {
+                // load image
+                ltp.jobs_load = jobs_load;
+                ltp.input0_files = input0_files;
+                ltp.input1_files = input1_files;
+                ltp.output_files = output_files;
+                ltp.timesteps = timesteps;
+
+                // ncnn::Thread load_thread(load, (void*)&ltp);
+                load_thread_ptr = new ncnn::Thread(load, (void*)&ltp);
+            }
+            else {
+                // load video
+                lvtp.input_videopath = input_videopath;
+                lvtp.outputpath = outputpath;
+                lvtp.pattern = pattern;
+                lvtp.format = format;
+
+                // ncnn::Thread load_thread(load_video, (void*)&ltp);
+                load_thread_ptr = new ncnn::Thread(load_video, (void*)&lvtp);
+            }
 
             // rife proc
             std::vector<ProcThreadParams> ptp(use_gpu_count);
@@ -876,7 +1122,7 @@ int main(int argc, char** argv)
             }
 
             // end
-            load_thread.join();
+            load_thread_ptr->join();
 
             Task end;
             end.id = -233;

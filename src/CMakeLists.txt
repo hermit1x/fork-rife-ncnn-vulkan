@@ -14,6 +14,9 @@ option(USE_SYSTEM_NCNN "build with system libncnn" OFF)
 option(USE_SYSTEM_WEBP "build with system libwebp" OFF)
 option(USE_STATIC_MOLTENVK "link moltenvk static library" OFF)
 
+# set(OpenCV_DIR ${CMAKE_CURRENT_SOURCE_DIR}/opencv-mobile-4.10.0-android/sdk/native/jni)
+
+# find_package(OpenCV REQUIRED)
 find_package(Threads)
 find_package(OpenMP)
 find_package(Vulkan REQUIRED)
@@ -290,4 +293,5 @@ if(USE_STATIC_MOLTENVK)
     )
 endif()
 
-target_link_libraries(rife-ncnn-vulkan ${RIFE_LINK_LIBRARIES})
+# target_link_libraries(rife-ncnn-vulkan ${RIFE_LINK_LIBRARIES} ${OpenCV_LIBS} mediandk)
+target_link_libraries(rife-ncnn-vulkan ${RIFE_LINK_LIBRARIES} mediandk)
