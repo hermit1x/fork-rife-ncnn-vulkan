@@ -5,6 +5,7 @@
 #include <queue>
 #include <vector>
 #include <clocale>
+#include <thread>
 
 #if _WIN32
 // image decoder and encoder with wic
@@ -71,6 +72,7 @@ static std::vector<int> parse_optarg_int_array(const wchar_t* optarg)
 }
 #else // _WIN32
 #include <unistd.h> // getopt()
+#include <fcntl.h>  // O_CREAT, O_RDWR
 
 static std::vector<int> parse_optarg_int_array(const char* optarg)
 {
@@ -343,9 +345,12 @@ void* load(void* args)
     return 0;
 }
 
-// #include <opencv2/opencv.hpp>
+#include <opencv2/opencv.hpp>
 #include <media/NdkMediaCodec.h>
 #include <media/NdkMediaExtractor.h>
+#include <media/NdkMediaMuxer.h>
+#include <media/NdkMediaFormat.h>
+#include <media/NdkMediaError.h>
 class LoadVideoThreadParams
 {
 public:
@@ -399,7 +404,7 @@ void* load_video(void* args) {
         return 0;
     }
 
-    // init codec
+    // init decoder
     AMediaFormat* videoFormat = AMediaExtractor_getTrackFormat(extractor, videoTrackIndex);
     AMediaExtractor_selectTrack(extractor, videoTrackIndex);
 
@@ -411,9 +416,9 @@ void* load_video(void* args) {
 
     const char* mime = nullptr;
     AMediaFormat_getString(videoFormat, AMEDIAFORMAT_KEY_MIME, &mime);
-    AMediaCodec* codec = AMediaCodec_createDecoderByType(mime);
-    AMediaCodec_configure(codec, videoFormat, nullptr, nullptr, 0);
-    AMediaCodec_start(codec);
+    AMediaCodec* decoder = AMediaCodec_createDecoderByType(mime);
+    AMediaCodec_configure(decoder, videoFormat, nullptr, nullptr, 0);
+    AMediaCodec_start(decoder);
 
     int frame_id = 0;
     unsigned char *pre_pixeldata = nullptr;
@@ -424,10 +429,10 @@ void* load_video(void* args) {
     while (!sawOutputEOS) {
         // 处理输入缓冲区
         if (!sawInputEOS) {
-            ssize_t inputBufferIndex = AMediaCodec_dequeueInputBuffer(codec, 1000);
+            ssize_t inputBufferIndex = AMediaCodec_dequeueInputBuffer(decoder, 1000);
             if (inputBufferIndex >= 0) {
                 size_t inputBufferSize;
-                unsigned char* inputBuffer = AMediaCodec_getInputBuffer(codec, inputBufferIndex, &inputBufferSize);
+                unsigned char* inputBuffer = AMediaCodec_getInputBuffer(decoder, inputBufferIndex, &inputBufferSize);
 
                 ssize_t sampleSize = AMediaExtractor_readSampleData(extractor, inputBuffer, inputBufferSize);
                 if (sampleSize < 0) {
@@ -436,7 +441,7 @@ void* load_video(void* args) {
                 }
 
                 uint64_t presentationTimeUs = AMediaExtractor_getSampleTime(extractor);
-                AMediaCodec_queueInputBuffer(codec, inputBufferIndex, 0, sampleSize,
+                AMediaCodec_queueInputBuffer(decoder, inputBufferIndex, 0, sampleSize,
                                                 presentationTimeUs,
                                                 sawInputEOS ? AMEDIACODEC_BUFFER_FLAG_END_OF_STREAM : 0);
 
@@ -446,7 +451,7 @@ void* load_video(void* args) {
 
         // 处理输出缓冲区
         AMediaCodecBufferInfo bufferInfo;
-        ssize_t outputBufferIndex = AMediaCodec_dequeueOutputBuffer(codec, &bufferInfo, 1000);
+        ssize_t outputBufferIndex = AMediaCodec_dequeueOutputBuffer(decoder, &bufferInfo, 1000);
 
         if (outputBufferIndex >= 0) {
             if (bufferInfo.flags & AMEDIACODEC_BUFFER_FLAG_END_OF_STREAM) {
@@ -454,7 +459,7 @@ void* load_video(void* args) {
             }
             
             size_t outputBufferSize; // Y 占 1个字节，U,V 各占 1/4，outBufferSize = width * height * 1.5
-            uint8_t* outputBuffer = AMediaCodec_getOutputBuffer(codec, outputBufferIndex, &outputBufferSize);
+            uint8_t* outputBuffer = AMediaCodec_getOutputBuffer(decoder, outputBufferIndex, &outputBufferSize);
             // printf("load %d\n", frame_id * 2);
             
             if (pre_pixeldata == nullptr) {
@@ -483,7 +488,7 @@ void* load_video(void* args) {
                 toproc.put(v);
                 frame_id++;
 
-                AMediaCodec_releaseOutputBuffer(codec, outputBufferIndex, false);
+                AMediaCodec_releaseOutputBuffer(decoder, outputBufferIndex, false);
                 continue;
             }
 
@@ -534,17 +539,17 @@ void* load_video(void* args) {
 
             frame_id++;
 
-            AMediaCodec_releaseOutputBuffer(codec, outputBufferIndex, false);
+            AMediaCodec_releaseOutputBuffer(decoder, outputBufferIndex, false);
         }
         // else if (outputBufferIndex == AMEDIACODEC_INFO_OUTPUT_BUFFERS_CHANGED) {
         // }
         // else if (outputBufferIndex == AMEDIACODEC_INFO_OUTPUT_FORMAT_CHANGED) {
-        //     AMediaFormat* newFormat = AMediaCodec_getOutputFormat(codec);
+        //     AMediaFormat* newFormat = AMediaCodec_getOutputFormat(decoder);
         // }
     }
 
-    AMediaCodec_stop(codec);
-    AMediaCodec_delete(codec);
+    AMediaCodec_stop(decoder);
+    AMediaCodec_delete(decoder);
     AMediaExtractor_delete(extractor);
     fclose(video_file);
     free(pre_pixeldata);
@@ -651,6 +656,231 @@ void* save(void* args)
     return 0;
 }
 
+class SaveVideoThreadParams
+{
+public:
+    int verbose;
+    int width;
+    int height;
+    int fps;
+    std::string output_video_path;
+};
+
+void* save_video(void* args)
+{
+
+    const SaveVideoThreadParams* stp = (const SaveVideoThreadParams*)args;
+    const int verbose = stp->verbose;
+
+    // ================== 初始化编码器和 Muxer ==================
+    AMediaCodec* encoder = nullptr;
+    AMediaMuxer* muxer = nullptr;
+    int muxerTrackIndex = -1;
+    bool muxerStarted = false;
+    int64_t presentationTimeUs = 0;
+    const int frameIntervalUs = 1000000 / stp->fps;
+
+    // 创建编码器
+    encoder = AMediaCodec_createEncoderByType("video/avc");
+    AMediaFormat* format = AMediaFormat_new();
+
+
+    AMediaFormat_setString(format, AMEDIAFORMAT_KEY_MIME, "video/avc");
+    AMediaFormat_setInt32(format, AMEDIAFORMAT_KEY_WIDTH, stp->width);
+    AMediaFormat_setInt32(format, AMEDIAFORMAT_KEY_HEIGHT, stp->height);
+
+    /*
+    MediaCodecInfo在NDK中没有相关接口，直接使用数值
+    Codec: c2.android.avc.encoder, Type: video/avc, 
+    Supported Color Formats: 
+    2135033992, // COLOR_FormatYUV420Flexible
+    19,         // COLOR_FormatYUV420Planar
+    21,         // COLOR_FormatYUV420SemiPlanar
+    20,         // COLOR_FormatYUV420PackedPlanar
+    39,         // COLOR_FormatYUV420PackedSemiPlanar
+    2130708361  // COLOR_FormatSurface
+    Codec: OMX.google.h264.encoder, Type: video/avc, 
+    Supported Color Formats: 2135033992, 19, 21, 20, 39, 2130708361
+    */
+    // AMediaFormat_setInt32(format, AMEDIAFORMAT_KEY_COLOR_FORMAT, 0x7f420888); // COLOR_FormatYUV420Flexible
+    AMediaFormat_setInt32(format, AMEDIAFORMAT_KEY_COLOR_FORMAT, 19);
+
+    AMediaFormat_setInt32(format, AMEDIAFORMAT_KEY_BIT_RATE, 8000000);
+    AMediaFormat_setInt32(format, AMEDIAFORMAT_KEY_FRAME_RATE, stp->fps);
+    AMediaFormat_setInt32(format, AMEDIAFORMAT_KEY_I_FRAME_INTERVAL, 1);
+
+    
+    
+    media_status_t status = AMediaCodec_configure(encoder, format, nullptr, nullptr, AMEDIACODEC_CONFIGURE_FLAG_ENCODE);
+    if (status != AMEDIA_OK) {
+        printf("Failed to configure encoder: %d, format: %s\n", status, AMediaFormat_toString(format));
+        AMediaCodec_delete(encoder);
+        AMediaFormat_delete(format);
+    }
+
+    status = AMediaCodec_start(encoder);
+    if (status != AMEDIA_OK) {
+        printf("Failed to start encoder: %d\n", status);
+        AMediaCodec_delete(encoder);
+        AMediaFormat_delete(format);
+    }
+
+    // 创建 Muxer
+    int fd = open(stp->output_video_path.c_str(), O_CREAT | O_RDWR, 0644);
+    muxer = AMediaMuxer_new(fd, AMEDIAMUXER_OUTPUT_FORMAT_MPEG_4);
+
+    if (fd < 0 || muxer == nullptr) {
+        printf("Failed to create muxer: %d\n", fd);
+        if (fd >= 0) close(fd);
+        AMediaCodec_delete(encoder);
+        return 0;
+    }
+
+    std::thread inputThread([&]() {
+        for (;;)
+        {
+            Task v;
+            tosave.get(v);
+
+            if (v.id == -233) {
+                // 发送 EOS 信号
+                ssize_t inputBufferIndex = AMediaCodec_dequeueInputBuffer(encoder, 1000);
+                if (inputBufferIndex >= 0) {
+                    AMediaCodec_queueInputBuffer(
+                        encoder,
+                        inputBufferIndex,
+                        0,
+                        0,
+                        presentationTimeUs,
+                        AMEDIACODEC_BUFFER_FLAG_END_OF_STREAM
+                    );
+                }
+                break;
+            }
+
+            // 将 RGB 转换为 YUV420
+            cv::Mat rgbMat(v.outimage.h, v.outimage.w, CV_8UC3, (void*)v.outimage.data);
+            cv::Mat yuvMat;
+            cv::cvtColor(rgbMat, yuvMat, cv::COLOR_RGB2YUV_I420); // match COLOR_FormatYUV420Planar
+
+            // 提交到编码器输入缓冲区
+            ssize_t inputBufferIndex = AMediaCodec_dequeueInputBuffer(encoder, 1000000); // 1s
+            while (inputBufferIndex < 0) {
+                inputBufferIndex = AMediaCodec_dequeueInputBuffer(encoder, 1000000);
+                printf("reget inputBufferIndex: %zd\n", inputBufferIndex);
+            }
+            size_t inputBufferSize;
+            uint8_t* inputBuffer = AMediaCodec_getInputBuffer(encoder, inputBufferIndex, &inputBufferSize);
+
+            if (yuvMat.total() * yuvMat.elemSize() <= inputBufferSize) {
+                memcpy(inputBuffer, yuvMat.data, yuvMat.total() * yuvMat.elemSize());
+                AMediaCodec_queueInputBuffer(
+                    encoder,
+                    inputBufferIndex,
+                    0,
+                    yuvMat.total() * yuvMat.elemSize(),
+                    presentationTimeUs,
+                    0
+                );
+                presentationTimeUs += frameIntervalUs;
+            } else {
+                printf("Input buffer too small: %zu < %zu\n", inputBufferSize, yuvMat.total() * yuvMat.elemSize());
+                break;
+            }
+
+            // 释放资源（保持原有逻辑）
+            {
+                // ... 原有释放 in0image 和 in1image 的代码 ...
+                unsigned char* pixeldata = (unsigned char*)v.in0image.data;
+                if (v.webp0 == 1) {
+                    free(pixeldata);
+                } else {
+                    stbi_image_free(pixeldata);
+                }
+                pixeldata = (unsigned char*)v.in1image.data;
+                if (v.webp1 == 1) {
+                    free(pixeldata);
+                } else {
+                    stbi_image_free(pixeldata);
+                }
+            }
+        }
+    });
+    
+
+    std::thread outputThread( [&]() {
+        for(;;) {
+            AMediaCodecBufferInfo bufferInfo;
+            ssize_t outputBufferIndex = AMediaCodec_dequeueOutputBuffer(encoder, &bufferInfo, 0);
+            while (outputBufferIndex >= 0) {
+                if (!muxerStarted) {
+                    AMediaFormat* outputFormat = AMediaCodec_getOutputFormat(encoder);
+                    muxerTrackIndex = AMediaMuxer_addTrack(muxer, outputFormat);
+                    AMediaMuxer_start(muxer);
+                    muxerStarted = true;
+                    AMediaFormat_delete(outputFormat);
+                }
+
+                size_t outputBufferSize;
+                uint8_t* outputBuffer = AMediaCodec_getOutputBuffer(encoder, outputBufferIndex, &outputBufferSize);
+
+                AMediaMuxer_writeSampleData(
+                    muxer,
+                    muxerTrackIndex,
+                    outputBuffer,
+                    &bufferInfo
+                );
+                AMediaCodec_releaseOutputBuffer(encoder, outputBufferIndex, false);
+                outputBufferIndex = AMediaCodec_dequeueOutputBuffer(encoder, &bufferInfo, 0);
+            }
+
+            if (bufferInfo.flags & AMEDIACODEC_BUFFER_FLAG_END_OF_STREAM) {
+                AMediaCodec_releaseOutputBuffer(encoder, outputBufferIndex, false);
+                break;
+            }
+        }
+    });
+
+    inputThread.join();
+    outputThread.join();
+    
+
+    // ================== 清理资源 ==================
+    // 处理剩余输出数据
+    while (true) {
+        AMediaCodecBufferInfo bufferInfo;
+        ssize_t outputBufferIndex = AMediaCodec_dequeueOutputBuffer(encoder, &bufferInfo, 1000);
+        if (outputBufferIndex < 0) break;
+        
+        if (bufferInfo.flags & AMEDIACODEC_BUFFER_FLAG_END_OF_STREAM) {
+            AMediaCodec_releaseOutputBuffer(encoder, outputBufferIndex, false);
+            break;
+        }
+        
+        // 写入剩余数据
+        if (muxerStarted) {
+            size_t outputBufferSize;
+            uint8_t* outputBuffer = AMediaCodec_getOutputBuffer(encoder, outputBufferIndex, &outputBufferSize);
+            AMediaMuxer_writeSampleData(muxer, muxerTrackIndex, outputBuffer, &bufferInfo);
+        }
+        AMediaCodec_releaseOutputBuffer(encoder, outputBufferIndex, false);
+    }
+
+    AMediaFormat_delete(format);
+
+    // 释放编码器
+    AMediaCodec_stop(encoder);
+    AMediaCodec_delete(encoder);
+    
+    // 释放 Muxer
+    if (muxerStarted) {
+        AMediaMuxer_stop(muxer);
+    }
+    AMediaMuxer_delete(muxer);
+    close(fd);
+
+    return 0;
+}
 
 #if _WIN32
 int wmain(int argc, wchar_t** argv)
@@ -676,66 +906,7 @@ int main(int argc, char** argv)
     int uhd_mode = 0;
     path_t pattern_format = PATHSTR("%08d.png");
 
-#if _WIN32
-    setlocale(LC_ALL, "");
-    wchar_t opt;
-    while ((opt = getopt(argc, argv, L"0:1:i:o:I:n:s:m:g:j:f:vxzuh")) != (wchar_t)-1)
-    {
-        switch (opt)
-        {
-        case L'0':
-            input0path = optarg;
-            break;
-        case L'1':
-            input1path = optarg;
-            break;
-        case L'i':
-            inputpath = optarg;
-            break;
-        case L'o':
-            outputpath = optarg;
-            break;
-        case L'I':
-            input_videopath = optarg;
-            break;
-        case L'n':
-            numframe = _wtoi(optarg);
-            break;
-        case L's':
-            timestep = _wtof(optarg);
-            break;
-        case L'm':
-            model = optarg;
-            break;
-        case L'g':
-            gpuid = parse_optarg_int_array(optarg);
-            break;
-        case L'j':
-            swscanf(optarg, L"%d:%*[^:]:%d", &jobs_load, &jobs_save);
-            jobs_proc = parse_optarg_int_array(wcschr(optarg, L':') + 1);
-            break;
-        case L'f':
-            pattern_format = optarg;
-            break;
-        case L'v':
-            verbose = 1;
-            break;
-        case L'x':
-            tta_mode = 1;
-            break;
-        case L'z':
-            tta_temporal_mode = 1;
-            break;
-        case L'u':
-            uhd_mode = 1;
-            break;
-        case L'h':
-        default:
-            print_usage();
-            return -1;
-        }
-    }
-#else // _WIN32
+
     int opt;
     while ((opt = getopt(argc, argv, "0:1:i:o:I:n:s:m:g:j:f:vxzuh")) != -1)
     {
@@ -793,7 +964,6 @@ int main(int argc, char** argv)
             return -1;
         }
     }
-#endif // _WIN32
 
     if (((input0path.empty() || input1path.empty()) && inputpath.empty() && input_videopath.empty()) || outputpath.empty())
     {
@@ -865,6 +1035,10 @@ int main(int argc, char** argv)
         {
             format = PATHSTR("jpg");
         }
+        else if (ext == PATHSTR("mp4") || ext == PATHSTR("MP4"))
+        {
+            format = PATHSTR("mp4");
+        }
         else
         {
             fprintf(stderr, "invalid outputpath extension type\n");
@@ -872,7 +1046,7 @@ int main(int argc, char** argv)
         }
     }
 
-    if (format != PATHSTR("png") && format != PATHSTR("webp") && format != PATHSTR("jpg"))
+    if (format != PATHSTR("png") && format != PATHSTR("webp") && format != PATHSTR("jpg") && format != PATHSTR("mp4"))
     {
         fprintf(stderr, "invalid format argument\n");
         return -1;
@@ -917,10 +1091,16 @@ int main(int argc, char** argv)
     std::vector<path_t> output_files;
     std::vector<float> timesteps;
     bool input_video_flag = false;
+    bool save_video_flag = false;
     {
         if (!input_videopath.empty() && !path_is_directory(input_videopath) && path_is_directory(outputpath)) {
             input_video_flag = true;
+            save_video_flag = false;
             // printf("use video input\n");
+        }
+        else if (!input_videopath.empty() && !path_is_directory(input_videopath) && !path_is_directory(outputpath)) {
+            input_video_flag = true;
+            save_video_flag = true;
         }
         else if (!inputpath.empty() && path_is_directory(inputpath) && path_is_directory(outputpath))
         {
@@ -1113,12 +1293,29 @@ int main(int argc, char** argv)
 
             // save image
             SaveThreadParams stp;
-            stp.verbose = verbose;
+            SaveVideoThreadParams svtp;
+            if (save_video_flag) {
+                // save video
+                svtp.output_video_path = outputpath;
+                svtp.width = 1280;
+                svtp.height = 720;
+                svtp.fps = 60;
+                jobs_save = 1;
+            }
+            else {
+                // save image
+                stp.verbose = verbose;
+            }
 
             std::vector<ncnn::Thread*> save_threads(jobs_save);
             for (int i=0; i<jobs_save; i++)
             {
-                save_threads[i] = new ncnn::Thread(save, (void*)&stp);
+                if (save_video_flag) {
+                    save_threads[i] = new ncnn::Thread(save_video, (void*)&svtp);
+                }
+                else {
+                    save_threads[i] = new ncnn::Thread(save, (void*)&stp);
+                }
             }
 
             // end
